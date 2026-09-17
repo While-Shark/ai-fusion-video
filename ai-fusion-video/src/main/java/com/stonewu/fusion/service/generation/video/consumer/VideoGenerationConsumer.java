@@ -12,6 +12,7 @@ import com.stonewu.fusion.infrastructure.queue.RedisTaskQueue;
 import com.stonewu.fusion.service.ai.AiModelService;
 import com.stonewu.fusion.service.ai.ApiConfigService;
 import com.stonewu.fusion.service.ai.comfyui.ComfyUiWorkflowService;
+import com.stonewu.fusion.service.ai.proxy.AiProxySupport;
 import com.stonewu.fusion.service.generation.GenerationModelCapabilityService;
 import com.stonewu.fusion.service.generation.ReferenceImageTransportService;
 import com.stonewu.fusion.service.generation.video.VideoFrameExtractor;
@@ -22,9 +23,17 @@ import com.stonewu.fusion.service.storage.MediaStorageService;
 import jakarta.annotation.PreDestroy;
 import lombok.RequiredArgsConstructor;
 import lombok.extern.slf4j.Slf4j;
+import okhttp3.OkHttpClient;
+import okhttp3.Request;
+import okhttp3.Response;
 import org.springframework.scheduling.annotation.Scheduled;
 import org.springframework.stereotype.Component;
 
+import java.io.IOException;
+import java.net.URI;
+import java.nio.file.Files;
+import java.nio.file.Path;
+import java.nio.file.StandardCopyOption;
 import java.util.ArrayList;
 import java.util.LinkedHashSet;
 import java.util.List;
@@ -32,6 +41,7 @@ import java.util.Locale;
 import java.util.Set;
 import java.util.concurrent.ExecutorService;
 import java.util.concurrent.Executors;
+import java.util.concurrent.TimeUnit;
 import java.util.concurrent.atomic.AtomicInteger;
 
 /**
@@ -63,6 +73,11 @@ public class VideoGenerationConsumer {
         thread.setDaemon(true);
         return thread;
     });
+    private final OkHttpClient protectedMediaHttpClient = new OkHttpClient.Builder()
+            .connectTimeout(1, TimeUnit.MINUTES)
+            .readTimeout(25, TimeUnit.MINUTES)
+            .writeTimeout(60, TimeUnit.SECONDS)
+            .build();
 
     /**
      * 提交生视频任务到队列
@@ -262,7 +277,7 @@ public class VideoGenerationConsumer {
 
             // 持久化远程视频文件到本地/OSS 存储
             if (!strategy.persistsResults()) {
-                persistVideoItems(task);
+                persistVideoItems(task, apiConfig);
             }
 
             videoGenerationService.updateStatus(task.getId(), 2, null);
@@ -356,16 +371,25 @@ public class VideoGenerationConsumer {
      * 首帧统一作为封面；提帧失败时保留平台封面和原视频。
      */
     void persistVideoItems(VideoTask task) {
+        persistVideoItems(task, null);
+    }
+
+    /**
+     * 持久化视频与平台返回的帧。对于和 API 配置同源的受保护媒体 URL，
+     * 后端会携带当前 API Bearer Token 下载，避免浏览器直接访问受保护预览地址。
+     */
+    void persistVideoItems(VideoTask task, ApiConfig apiConfig) {
         List<VideoItem> items = videoGenerationService.listItems(task.getId());
         for (VideoItem item : items) {
             boolean updated = false;
 
             if (StrUtil.isNotBlank(item.getVideoUrl())) {
                 try {
-                    String persistedUrl = mediaStorageService.downloadAndStore(item.getVideoUrl(), "videos");
+                    String persistedUrl = persistProviderMedia(
+                            item.getVideoUrl(), "videos", apiConfig, true);
                     item.setVideoUrl(persistedUrl);
                     updated = true;
-                    log.info("[VideoConsumer] 视频已持久化: itemId={}", item.getId());
+                    log.info("[VideoConsumer] 视频已持久化: itemId={}, stored={}", item.getId(), persistedUrl);
                 } catch (Exception e) {
                     log.warn("[VideoConsumer] 视频持久化失败（保留原始 URL）: itemId={}, error={}",
                             item.getId(), e.getMessage());
@@ -374,8 +398,8 @@ public class VideoGenerationConsumer {
 
             if (StrUtil.isNotBlank(item.getFirstFrameUrl())) {
                 try {
-                    item.setFirstFrameUrl(mediaStorageService.downloadAndStore(
-                            item.getFirstFrameUrl(), "images/video-frames"));
+                    item.setFirstFrameUrl(persistProviderMedia(
+                            item.getFirstFrameUrl(), "images/video-frames", apiConfig, false));
                     updated = true;
                 } catch (Exception e) {
                     log.warn("[VideoConsumer] 视频首帧持久化失败: itemId={}, error={}",
@@ -385,8 +409,8 @@ public class VideoGenerationConsumer {
 
             if (StrUtil.isNotBlank(item.getLastFrameUrl())) {
                 try {
-                    item.setLastFrameUrl(mediaStorageService.downloadAndStore(
-                            item.getLastFrameUrl(), "images/video-frames"));
+                    item.setLastFrameUrl(persistProviderMedia(
+                            item.getLastFrameUrl(), "images/video-frames", apiConfig, false));
                     updated = true;
                 } catch (Exception e) {
                     log.warn("[VideoConsumer] 视频尾帧持久化失败: itemId={}, error={}",
@@ -415,7 +439,7 @@ public class VideoGenerationConsumer {
                 updated = true;
             } else if (StrUtil.isNotBlank(item.getCoverUrl())) {
                 try {
-                    item.setCoverUrl(mediaStorageService.downloadAndStore(item.getCoverUrl(), "images"));
+                    item.setCoverUrl(persistProviderMedia(item.getCoverUrl(), "images", apiConfig, false));
                     updated = true;
                 } catch (Exception e) {
                     log.warn("[VideoConsumer] 视频封面持久化失败: itemId={}, error={}",
@@ -427,5 +451,136 @@ public class VideoGenerationConsumer {
                 videoGenerationService.updateItem(item);
             }
         }
+    }
+
+    private String persistProviderMedia(String sourceUrl,
+                                        String subDir,
+                                        ApiConfig apiConfig,
+                                        boolean video) {
+        if (StrUtil.isBlank(sourceUrl) || sourceUrl.startsWith("/media/")) {
+            return sourceUrl;
+        }
+
+        // Public/presigned third-party URLs keep using the existing storage strategy.
+        // Only same-origin provider URLs receive the API Authorization header.
+        if (!shouldForwardApiAuthorization(sourceUrl, apiConfig)) {
+            return mediaStorageService.downloadAndStore(sourceUrl, subDir);
+        }
+
+        Request request = new Request.Builder()
+                .url(sourceUrl)
+                .addHeader("Authorization", "Bearer " + apiConfig.getApiKey())
+                .addHeader("Accept", video ? "video/*,*/*;q=0.8" : "image/*,*/*;q=0.8")
+                .get()
+                .build();
+
+        OkHttpClient client = AiProxySupport.okHttpClient(protectedMediaHttpClient, apiConfig);
+        Path tempFile = null;
+        try (Response response = client.newCall(request).execute()) {
+            if (!response.isSuccessful() || response.body() == null) {
+                String body = response.body() != null ? response.body().string() : "";
+                throw new BusinessException("受保护媒体下载失败: HTTP " + response.code()
+                        + (StrUtil.isNotBlank(body) ? " - " + StrUtil.sub(body, 0, 240) : ""));
+            }
+
+            String extension = resolveMediaExtension(response.header("Content-Type"), sourceUrl, video);
+            tempFile = Files.createTempFile("fusion-provider-media-", "." + extension);
+            Files.copy(response.body().byteStream(), tempFile, StandardCopyOption.REPLACE_EXISTING);
+            if (Files.size(tempFile) <= 0) {
+                throw new BusinessException("受保护媒体下载结果为空");
+            }
+
+            String storedUrl = mediaStorageService.storeFile(tempFile, subDir, extension);
+            log.info("[VideoConsumer] 受保护媒体已持久化: source={}, stored={}", sourceUrl, storedUrl);
+            return storedUrl;
+        } catch (IOException e) {
+            throw new BusinessException("受保护媒体下载异常: " + e.getMessage());
+        } finally {
+            if (tempFile != null) {
+                try {
+                    Files.deleteIfExists(tempFile);
+                } catch (IOException e) {
+                    log.warn("[VideoConsumer] 清理媒体临时文件失败: path={}, error={}", tempFile, e.getMessage());
+                }
+            }
+        }
+    }
+
+    private boolean shouldForwardApiAuthorization(String mediaUrl, ApiConfig apiConfig) {
+        if (apiConfig == null || StrUtil.isBlank(apiConfig.getApiKey()) || StrUtil.isBlank(apiConfig.getApiUrl())) {
+            return false;
+        }
+        try {
+            URI media = URI.create(mediaUrl);
+            URI api = URI.create(apiConfig.getApiUrl());
+            return isHttpScheme(media.getScheme())
+                    && equalsIgnoreCase(media.getScheme(), api.getScheme())
+                    && equalsIgnoreCase(media.getHost(), api.getHost())
+                    && effectivePort(media) == effectivePort(api);
+        } catch (IllegalArgumentException e) {
+            return false;
+        }
+    }
+
+    private static boolean isHttpScheme(String scheme) {
+        return "http".equalsIgnoreCase(scheme) || "https".equalsIgnoreCase(scheme);
+    }
+
+    private static boolean equalsIgnoreCase(String left, String right) {
+        return left != null && right != null && left.equalsIgnoreCase(right);
+    }
+
+    private static int effectivePort(URI uri) {
+        if (uri.getPort() >= 0) {
+            return uri.getPort();
+        }
+        if ("https".equalsIgnoreCase(uri.getScheme())) {
+            return 443;
+        }
+        if ("http".equalsIgnoreCase(uri.getScheme())) {
+            return 80;
+        }
+        return -1;
+    }
+
+    private static String resolveMediaExtension(String contentType, String sourceUrl, boolean video) {
+        String mimeType = StrUtil.blankToDefault(contentType, "")
+                .split(";", 2)[0]
+                .trim()
+                .toLowerCase(Locale.ROOT);
+        String fromMimeType = switch (mimeType) {
+            case "video/mp4" -> "mp4";
+            case "video/webm" -> "webm";
+            case "video/quicktime" -> "mov";
+            case "video/x-matroska" -> "mkv";
+            case "image/jpeg", "image/jpg" -> "jpg";
+            case "image/png" -> "png";
+            case "image/webp" -> "webp";
+            case "image/gif" -> "gif";
+            case "image/avif" -> "avif";
+            default -> null;
+        };
+        if (fromMimeType != null) {
+            return fromMimeType;
+        }
+
+        try {
+            String path = URI.create(sourceUrl).getPath();
+            if (StrUtil.isNotBlank(path)) {
+                String lower = path.toLowerCase(Locale.ROOT);
+                if (lower.endsWith(".mp4")) return "mp4";
+                if (lower.endsWith(".webm")) return "webm";
+                if (lower.endsWith(".mov")) return "mov";
+                if (lower.endsWith(".mkv")) return "mkv";
+                if (lower.endsWith(".jpg") || lower.endsWith(".jpeg")) return "jpg";
+                if (lower.endsWith(".png")) return "png";
+                if (lower.endsWith(".webp")) return "webp";
+                if (lower.endsWith(".gif")) return "gif";
+                if (lower.endsWith(".avif")) return "avif";
+            }
+        } catch (IllegalArgumentException ignored) {
+            // Fall through to a safe media-type default.
+        }
+        return video ? "mp4" : "png";
     }
 }
